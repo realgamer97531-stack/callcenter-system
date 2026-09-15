@@ -4212,7 +4212,15 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Student ID and relative number are required' });
     }
 
-    const student = await Student.findOne({ where: { student_code: String(student_id) } });
+    const identity = String(student_id).trim();
+    const student = await Student.findOne({
+      where: {
+        [Op.or]: [
+          { student_code: identity },
+          ...( /^\d+$/.test(identity) ? [{ id: Number(identity) }] : []),
+        ],
+      },
+    });
     if (!student) return res.status(404).json({ success: false, message: 'Student not found' });
 
     const matchingSession = await Session.findOne({
@@ -4239,12 +4247,15 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
     ].filter(Boolean).join(' | ');
     if (!combinedComment) return res.json({ success: true, updated: false });
 
-    const [sessionComment] = await SessionComment.findOrCreate({
+    const [sessionComment, created] = await SessionComment.findOrCreate({
       where: { StudentId: student.id, SessionId: matchingSession.id },
       defaults: { UserId: commentUser.id, comment: combinedComment },
     });
-    if (sessionComment.comment !== combinedComment) {
-      sessionComment.comment = combinedComment;
+    if (!created && sessionComment.comment !== combinedComment) {
+      const previousComment = String(sessionComment.comment || '').trim();
+      sessionComment.comment = previousComment
+        ? `${previousComment}\n${combinedComment}`
+        : combinedComment;
       sessionComment.UserId = commentUser.id;
       await sessionComment.save();
     }

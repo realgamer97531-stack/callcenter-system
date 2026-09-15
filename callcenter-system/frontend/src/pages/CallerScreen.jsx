@@ -202,9 +202,12 @@ function CallCard({ session, onLeave }) {
     setSubmitting(true);
     setError('');
     try {
-      await api.submitDisposition(row.id, disposition, comment);
+      const result = await api.submitDisposition(row.id, disposition, comment);
       setHistory((h) => [...h, { ...row, disposition, comment }]);
       await fetchNext();
+      if (!result.studentSystemSync) {
+        setError('Saved in call center, but the student follow-up dashboard was not updated. Check the call-center integration settings.');
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -227,9 +230,12 @@ function CallCard({ session, onLeave }) {
     setSubmitting(true);
     setError('');
     try {
-      await api.submitDisposition(row.id, 'skipped', comment);
+      const result = await api.submitDisposition(row.id, 'skipped', comment);
       setHistory((h) => [...h, { ...row, disposition: 'skipped', comment }]);
       await fetchNext();
+      if (!result.studentSystemSync) {
+        setError('Saved in call center, but the student follow-up dashboard was not updated. Check the call-center integration settings.');
+      }
     } catch (err) {
       setError(err.message);
     } finally {

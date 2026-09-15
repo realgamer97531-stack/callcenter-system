@@ -28,7 +28,7 @@ function syncCommentToStudentSystem(row, session, disposition, comment) {
       subject,
       sessionName: session.name,
     });
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
 
   const controller = new AbortController();
@@ -54,6 +54,7 @@ function syncCommentToStudentSystem(row, session, disposition, comment) {
       throw new Error(result.message || `Student-system callback failed (${response.status})`);
     }
     console.log(`Student-system comment synced for row ${row.id}, session ${result.session_id || 'unknown'}`);
+    return true;
   }).finally(() => clearTimeout(timeout));
 }
 
@@ -161,13 +162,14 @@ router.post('/rows/:id/disposition', requireAuth, async (req, res) => {
     );
 
     // Keep the existing call completion independent from the optional bridge.
+    let studentSystemSync = false;
     try {
-      await syncCommentToStudentSystem(row, session, disposition, comment);
+      studentSystemSync = await syncCommentToStudentSystem(row, session, disposition, comment);
     } catch (err) {
       console.error('Student-system comment sync failed:', err.message);
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, studentSystemSync });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
