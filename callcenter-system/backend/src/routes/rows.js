@@ -53,7 +53,10 @@ function syncCommentToStudentSystem(row, session, disposition, comment) {
     if (!response.ok) {
       throw new Error(result.message || `Student-system callback failed (${response.status})`);
     }
-    console.log(`Student-system comment synced for row ${row.id}, session ${result.session_id || 'unknown'}`);
+    if (!result.success || (comment && comment.trim() && !result.session_id)) {
+      throw new Error(`Student-system callback returned an unexpected response (${response.status})`);
+    }
+    console.log(`Student-system comment synced for row ${row.id}, session ${result.session_id || 'none'}`);
     return true;
   }).finally(() => clearTimeout(timeout));
 }
