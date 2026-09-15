@@ -4223,14 +4223,22 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
     });
     if (!student) return res.status(404).json({ success: false, message: 'Student not found' });
 
-    const matchingSession = await Session.findOne({
-      where: {
-        lesson_number: Number(relative),
-        CenterId: student.CenterId,
-        SubjectId: student.SubjectId,
-      },
+    const candidateSessions = await Session.findAll({
+      where: { lesson_number: Number(relative) },
       include: [Center, Subject],
+      order: [['id', 'DESC']],
     });
+    const requestedCenter = normalizeCallCenterIdentity(center);
+    const requestedSubject = String(subject || '').trim().toLowerCase();
+    const matchingSession = candidateSessions.find((candidate) => {
+      const candidateCenter = normalizeCallCenterIdentity(candidate.Center?.name);
+      const candidateSubject = String(candidate.Subject?.name || '').trim().toLowerCase();
+      return requestedCenter && requestedSubject
+        && candidateCenter === requestedCenter
+        && candidateSubject === requestedSubject;
+    }) || candidateSessions.find(candidate => (
+      candidate.CenterId === student.CenterId && candidate.SubjectId === student.SubjectId
+    ));
     if (!matchingSession) return res.status(404).json({ success: false, message: 'Matching session not found' });
 
     const configuredUserId = Number.parseInt(process.env.CALLCENTER_COMMENT_USER_ID, 10);
