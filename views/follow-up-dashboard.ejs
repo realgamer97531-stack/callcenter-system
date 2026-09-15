@@ -179,6 +179,7 @@
             <th>❓ أسئلة</th>
             <th>✅ واجب</th>
             <th>كومنت</th>
+            <th>كومنت Call Center</th>
           </tr>
         </thead>
         <tbody>
@@ -241,6 +242,13 @@
                   <input type="text" name="comment" class="form-control form-control-sm" style="font-size:0.75rem;" value="<%= row.sessionComment || '' %>" placeholder="كومنت...">
                   <button class="btn btn-sm" style="padding:2px 8px;background:#EEF0FB;color:#4338CA;white-space:nowrap;font-size:0.7rem;">حفظ</button>
                 </form>
+              </td>
+              <td style="min-width:220px;white-space:pre-line;vertical-align:top;">
+                <% if (row.callCenterComment) { %>
+                  <span style="font-size:0.75rem;color:#7C2D12;background:#FFF7ED;padding:4px 6px;border-radius:4px;display:block;"><%= row.callCenterComment %></span>
+                <% } else { %>
+                  <span class="text-muted small">-</span>
+                <% } %>
               </td>
             </tr>
           <% }) %>

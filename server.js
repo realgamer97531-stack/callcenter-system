@@ -190,6 +190,52 @@ async function sendStudentsToCallCenter(name, students) {
   return result;
 }
 
+async function getCallCenterComments(studentIds) {
+  if (!isCallCenterIntegrationEnabled() || !studentIds.length) return {};
+  const configuredUrl = process.env.CALLCENTER_COMMENT_READ_URL;
+  const callbackUrl = process.env.CALLCENTER_INTERNAL_URL || '';
+    const derivedReadUrl = callbackUrl.replace(/\/internal\/?$/, '/internal/comments');
+    const readUrl = configuredUrl
+      || (!/127\.0\.0\.1|localhost/i.test(derivedReadUrl) && derivedReadUrl)
+      || 'https://callcenter-system-production.up.railway.app/api/sessions/internal/comments';
+  if (!readUrl) return {};
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(readUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Callcenter-Service-Token': process.env.CALLCENTER_SERVICE_TOKEN,
+      },
+      body: JSON.stringify({ student_ids: studentIds }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Call-center comments returned ${response.status}`);
+    const result = await response.json();
+    const commentsByStudentId = {};
+    (result.comments || []).forEach(comment => {
+      const key = String(comment.student_id);
+      if (!commentsByStudentId[key]) commentsByStudentId[key] = [];
+      commentsByStudentId[key].push(comment);
+    });
+    return Object.fromEntries(Object.entries(commentsByStudentId).map(([key, comments]) => [
+      key,
+      comments.map(comment => {
+        const outcome = comment.disposition ? `(${comment.disposition})` : '';
+        const date = comment.completed_at ? new Date(comment.completed_at).toLocaleString('ar-EG') : '';
+        return [date, outcome, comment.comment].filter(Boolean).join(' ');
+      }).join('\n'),
+    ]));
+  } catch (error) {
+    console.error('Could not load call-center comments:', error.message);
+    return {};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function callCenterStudent(student, details = {}) {
   return {
     student_id: student.student_code || student.id,
@@ -7127,7 +7173,7 @@ app.get('/follow-up-dashboard/export', requireFollowUp, async (req, res) => {
     const equivalentAttendanceSessionIds = equivalentAttendanceSessions.map(session => session.id);
     const video = await Video.findOne({ where: { SessionId: equivalentAttendanceSessionIds }, include: [{ model: VideoPart, order: [['order_index', 'ASC']] }] });
 
-    const [attendanceRecords, hwRecords, examResults, sessionComments] = await Promise.all([
+    const [attendanceRecords, hwRecords, examResults, sessionComments, callCenterComments] = await Promise.all([
       Attendance.findAll({
         where: { StudentId: studentIds, SessionId: equivalentAttendanceSessionIds },
         include: [User, { model: Session, include: [Center] }],
@@ -7142,6 +7188,7 @@ app.get('/follow-up-dashboard/export', requireFollowUp, async (req, res) => {
       SessionComment.findAll({
         where: { StudentId: studentIds, SessionId: selectedSession.id },
       }),
+      getCallCenterComments(students.map(student => student.student_code || student.id)),
     ]);
 
     const attendanceMap = {};
@@ -7182,6 +7229,7 @@ app.get('/follow-up-dashboard/export', requireFollowUp, async (req, res) => {
         examMax: examResult ? examResult.Exam?.max_score : null,
         videoWatch,
         sessionComment: sessionComment ? sessionComment.comment : null,
+        callCenterComment: callCenterComments[String(student.student_code || student.id)] || null,
       };
 
       if (!show_attended && !show_only_attended && row.attended) continue;

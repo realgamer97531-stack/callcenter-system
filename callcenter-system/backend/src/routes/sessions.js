@@ -75,6 +75,34 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
+// Read-only integration endpoint used by the student follow-up dashboard.
+router.post('/internal/comments', async (req, res) => {
+  if (!hasValidServiceToken(req)) return res.status(401).json({ error: 'Invalid service token' });
+
+  const studentIds = Array.isArray(req.body?.student_ids)
+    ? [...new Set(req.body.student_ids.map(value => String(value).trim()).filter(Boolean))]
+    : [];
+  if (studentIds.length === 0) return res.json({ comments: [] });
+
+  try {
+    const placeholders = studentIds.map(() => '?').join(', ');
+    const [comments] = await pool.query(
+      `SELECT r.student_id, r.comment, r.disposition, r.completed_at, s.name AS session_name
+       FROM call_rows r
+       INNER JOIN sessions s ON s.id = r.session_id
+       WHERE r.student_id IN (${placeholders})
+         AND r.status = 'done'
+         AND r.comment IS NOT NULL
+         AND TRIM(r.comment) <> ''
+       ORDER BY r.completed_at DESC, r.id DESC`,
+      studentIds
+    );
+    res.json({ comments });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/:id', requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM sessions WHERE id = ?', [req.params.id]);
