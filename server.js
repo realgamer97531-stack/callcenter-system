@@ -167,7 +167,7 @@ function isValidFollowUpSelectionToken(studentIds, filters, token) {
   return Boolean(token && expected && token.length === expected.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected)));
 }
 
-async function sendStudentsToCallCenter(name, students) {
+async function sendStudentsToCallCenter(name, students, mainSessionId = null) {
   if (!isCallCenterIntegrationEnabled()) {
     const error = new Error('Call-center integration is not enabled');
     error.code = 'CALLCENTER_DISABLED';
@@ -179,7 +179,7 @@ async function sendStudentsToCallCenter(name, students) {
       'Content-Type': 'application/json',
       'X-Callcenter-Service-Token': process.env.CALLCENTER_SERVICE_TOKEN,
     },
-    body: JSON.stringify({ name, students }),
+    body: JSON.stringify({ name, main_session_id: mainSessionId, students }),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -239,6 +239,7 @@ async function getCallCenterComments(studentIds) {
 function callCenterStudent(student, details = {}) {
   return {
     student_id: student.student_code || student.id,
+    main_session_id: details.mainSessionId || null,
     name: student.name,
     phone: student.phone,
     parent_phone: student.parent_phone,
@@ -2358,7 +2359,11 @@ async function handleSessionReportCallExport(req, res, scope) {
 
     const result = await sendStudentsToCallCenter(
       buildCallCenterSessionName({ session, scope: scope === 'present' ? 'Present' : 'Absent' }),
-      studentsWithDetails.map(item => callCenterStudent(item.student, item.details))
+      studentsWithDetails.map(item => callCenterStudent(item.student, {
+        ...item.details,
+        mainSessionId: session.id,
+      })),
+      session.id
     );
     res.json({ success: true, sessionId: result.id, imported: result.imported });
   } catch (error) {
@@ -4253,7 +4258,7 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
   }
 
   try {
-    const { student_id, relative, center, subject, comment, disposition } = req.body || {};
+    const { student_id, main_session_id, relative, center, subject, comment, disposition } = req.body || {};
     if (!student_id || !relative) {
       return res.status(400).json({ success: false, message: 'Student ID and relative number are required' });
     }
@@ -4269,22 +4274,30 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
     });
     if (!student) return res.status(404).json({ success: false, message: 'Student not found' });
 
-    const candidateSessions = await Session.findAll({
-      where: { lesson_number: Number(relative) },
-      include: [Center, Subject],
-      order: [['id', 'DESC']],
-    });
-    const requestedCenter = normalizeCallCenterIdentity(center);
-    const requestedSubject = String(subject || '').trim().toLowerCase();
-    const matchingSession = candidateSessions.find((candidate) => {
-      const candidateCenter = normalizeCallCenterIdentity(candidate.Center?.name);
-      const candidateSubject = String(candidate.Subject?.name || '').trim().toLowerCase();
-      return requestedCenter && requestedSubject
-        && candidateCenter === requestedCenter
-        && candidateSubject === requestedSubject;
-    }) || candidateSessions.find(candidate => (
-      candidate.CenterId === student.CenterId && candidate.SubjectId === student.SubjectId
-    ));
+    let matchingSession = null;
+    if (main_session_id) {
+      matchingSession = await Session.findOne({
+        where: { id: Number(main_session_id) },
+        include: [Center, Subject],
+      });
+    } else {
+      const candidateSessions = await Session.findAll({
+        where: { lesson_number: Number(relative) },
+        include: [Center, Subject],
+        order: [['id', 'DESC']],
+      });
+      const requestedCenter = normalizeCallCenterIdentity(center);
+      const requestedSubject = String(subject || '').trim().toLowerCase();
+      matchingSession = candidateSessions.find((candidate) => {
+        const candidateCenter = normalizeCallCenterIdentity(candidate.Center?.name);
+        const candidateSubject = String(candidate.Subject?.name || '').trim().toLowerCase();
+        return requestedCenter && requestedSubject
+          && candidateCenter === requestedCenter
+          && candidateSubject === requestedSubject;
+      }) || candidateSessions.find(candidate => (
+        candidate.CenterId === student.CenterId && candidate.SubjectId === student.SubjectId
+      ));
+    }
     if (!matchingSession) return res.status(404).json({ success: false, message: 'Matching session not found' });
 
     const configuredUserId = Number.parseInt(process.env.CALLCENTER_COMMENT_USER_ID, 10);
@@ -7173,7 +7186,7 @@ app.get('/follow-up-dashboard/export', requireFollowUp, async (req, res) => {
     const equivalentAttendanceSessionIds = equivalentAttendanceSessions.map(session => session.id);
     const video = await Video.findOne({ where: { SessionId: equivalentAttendanceSessionIds }, include: [{ model: VideoPart, order: [['order_index', 'ASC']] }] });
 
-    const [attendanceRecords, hwRecords, examResults, sessionComments, callCenterComments] = await Promise.all([
+    const [attendanceRecords, hwRecords, examResults, sessionComments] = await Promise.all([
       Attendance.findAll({
         where: { StudentId: studentIds, SessionId: equivalentAttendanceSessionIds },
         include: [User, { model: Session, include: [Center] }],
@@ -7188,7 +7201,6 @@ app.get('/follow-up-dashboard/export', requireFollowUp, async (req, res) => {
       SessionComment.findAll({
         where: { StudentId: studentIds, SessionId: selectedSession.id },
       }),
-      getCallCenterComments(students.map(student => student.student_code || student.id)),
     ]);
 
     const attendanceMap = {};
@@ -7229,7 +7241,6 @@ app.get('/follow-up-dashboard/export', requireFollowUp, async (req, res) => {
         examMax: examResult ? examResult.Exam?.max_score : null,
         videoWatch,
         sessionComment: sessionComment ? sessionComment.comment : null,
-        callCenterComment: callCenterComments[String(student.student_code || student.id)] || null,
       };
 
       if (!show_attended && !show_only_attended && row.attended) continue;
@@ -7341,7 +7352,8 @@ app.post('/follow-up-dashboard/send-to-callcenter', requireFollowUp, async (req,
 
     const result = await sendStudentsToCallCenter(
       buildCallCenterSessionName({ session: selectedSession, scope: 'Follow-up', filters }),
-      students.map(callCenterStudent)
+      students.map(student => callCenterStudent(student, { mainSessionId: selectedSession.id })),
+      selectedSession.id
     );
     res.json({ success: true, sessionId: result.id, imported: result.imported });
   } catch (error) {
