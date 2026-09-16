@@ -36,6 +36,7 @@ const ExamResult = require('./models/ExamResult');
 const User = require('./models/User');
 const bcrypt = require('bcryptjs');
 const ExcelJS = require('exceljs');
+const { ZipArchive } = require('archiver');
 const Video = require('./models/Video');
 const VideoPart = require('./models/VideoPart');
 const WatchProgress = require('./models/WatchProgress');
@@ -181,9 +182,16 @@ async function sendStudentsToCallCenter(name, students, mainSessionId = null) {
     },
     body: JSON.stringify({ name, main_session_id: mainSessionId, students }),
   });
-  const result = await response.json().catch(() => ({}));
+  const responseText = await response.text();
+  let result = {};
+  try {
+    result = responseText ? JSON.parse(responseText) : {};
+  } catch {
+    result = { raw: responseText.slice(0, 500) };
+  }
   if (!response.ok) {
-    const error = new Error(result.error || `Call-center returned ${response.status}`);
+    const detail = result.error || result.message || result.raw;
+    const error = new Error(detail || `Call-center returned ${response.status}`);
     error.status = response.status;
     throw error;
   }
@@ -564,7 +572,11 @@ async function connectWithRetry(maxAttempts = 5, delayMs = 5000) {
       return;
     } catch (error) {
       if (attempt === 1 || attempt === maxAttempts) {
-        console.error(`⚠️ اتصال قاعدة البيانات فشل (${attempt}/${maxAttempts}):`, error.message);
+        console.error(`⚠️ اتصال قاعدة البيانات فشل (${attempt}/${maxAttempts}):`, {
+          name: error.name,
+          code: error.original?.code || error.parent?.code || error.code,
+          message: error.message || error.original?.message || error.parent?.message || 'Unknown database error',
+        });
       }
       if (attempt === maxAttempts) {
         throw error;
@@ -4273,7 +4285,10 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
         ],
       },
     });
-    if (!student) return res.status(404).json({ success: false, message: 'Student not found' });
+    if (!student) {
+      console.warn('Call-center comment bridge: student not found', { student_id, identity });
+      return res.status(404).json({ success: false, message: `Student not found for ID "${identity}"` });
+    }
 
     let matchingSession = null;
     if (main_session_id) {
@@ -4281,7 +4296,11 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
         where: { id: Number(main_session_id) },
         include: [Center, Subject],
       });
-    } else {
+    }
+    // Fall back to relative/center/subject matching if there was no
+    // main_session_id (older call-center rows) or it pointed at a session
+    // that no longer matches anything, instead of failing outright.
+    if (!matchingSession) {
       const candidateSessions = await Session.findAll({
         where: { lesson_number: Number(relative) },
         include: [Center, Subject],
@@ -4299,7 +4318,10 @@ app.post('/api/internal/callcenter/session-comment', async (req, res) => {
         candidate.CenterId === student.CenterId && candidate.SubjectId === student.SubjectId
       ));
     }
-    if (!matchingSession) return res.status(404).json({ success: false, message: 'Matching session not found' });
+    if (!matchingSession) {
+      console.warn('Call-center comment bridge: no matching session', { student_id, main_session_id, relative, center, subject });
+      return res.status(404).json({ success: false, message: `Matching session not found (relative ${relative}, center "${center || '-'}", subject "${subject || '-'}")` });
+    }
 
     const configuredUserId = Number.parseInt(process.env.CALLCENTER_COMMENT_USER_ID, 10);
     const commentUser = configuredUserId
@@ -5545,7 +5567,7 @@ if (!process.env.VERCEL) cron.schedule('0 3 * * *', () => {
 // صفحة إدارة الأكواد (أدمن بس)
 app.get('/admin/recharge-codes', requireAdmin, async (req, res) => {
   try {
-    const codes = await RechargeCode.findAll({ order: [['createdAt', 'DESC']], limit: 100 });
+    const codes = await RechargeCode.findAll({ order: [['createdAt', 'DESC']] });
     const centers = await RechargeCenter.findAll({ order: [['name', 'ASC']] });
     const accounts = await RechargeCenterAccount.findAll({ attributes: ['recharge_center_id'] });
     const accountCenterIds = new Set(accounts.map(account => String(account.recharge_center_id)));
@@ -5616,6 +5638,50 @@ app.post('/admin/recharge-codes/generate', requireAdmin, async (req, res) => {
   }
 });
 
+app.post('/admin/recharge-codes/generate-batch', requireAdmin, async (req, res) => {
+  try {
+    const amount = Number(req.body.amount);
+    const fileCount = Number(req.body.file_count);
+    if (!amount || amount <= 0 || !Number.isInteger(fileCount) || fileCount < 1 || fileCount > 50) {
+      return res.status(400).send('❌ بيانات غير صحيحة');
+    }
+
+    const archive = new ZipArchive({ zlib: { level: 9 } });
+    archive.on('error', error => {
+      console.error('Failed to create recharge codes archive:', error);
+      res.destroy(error);
+    });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename=recharge_codes_${Date.now()}.zip`);
+    archive.pipe(res);
+
+    for (let fileIndex = 0; fileIndex < fileCount; fileIndex++) {
+      const generated = [];
+      for (let codeIndex = 0; codeIndex < 10; codeIndex++) {
+        const code = crypto.randomBytes(6).toString('hex').toUpperCase();
+        await RechargeCode.create({ code, amount, recharge_center_id: null });
+        generated.push({ code, amount });
+      }
+
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('أكواد الشحن');
+      sheet.columns = [
+        { header: 'الكود', key: 'code', width: 20 },
+        { header: 'القيمة (ج)', key: 'amount', width: 15 },
+      ];
+      generated.forEach(code => sheet.addRow(code));
+      sheet.getRow(1).font = { bold: true };
+      archive.append(await workbook.xlsx.writeBuffer(), { name: `recharge_codes_${fileIndex + 1}.xlsx` });
+    }
+
+    await archive.finalize();
+  } catch (error) {
+    console.error('Failed to generate recharge codes batch:', error);
+    if (!res.headersSent) res.status(500).send('❌ حصلت مشكلة: ' + error.message);
+    else res.destroy(error);
+  }
+});
+
 app.post('/admin/recharge-codes/link', requireAdmin, async (req, res) => {
   try {
     const requestedIds = Array.isArray(req.body.code_ids) ? req.body.code_ids : [req.body.code_ids];
@@ -5656,6 +5722,30 @@ app.post('/admin/recharge-codes/link', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('Failed to link recharge codes:', error);
     res.status(500).send('❌ حصلت مشكلة أثناء ربط الأكواد: ' + error.message);
+  }
+});
+
+app.post('/admin/recharge-codes/delete', requireAdmin, async (req, res) => {
+  try {
+    const requestedIds = Array.isArray(req.body.code_ids) ? req.body.code_ids : [req.body.code_ids];
+    const codeIds = [...new Set(requestedIds.map(Number).filter(Number.isInteger))];
+    if (codeIds.length === 0) return res.status(400).send('❌ لم يتم اختيار أكواد');
+
+    const selectedCodes = await RechargeCode.findAll({
+      where: { id: codeIds },
+      attributes: ['id', 'is_used'],
+      raw: true,
+    });
+    if (selectedCodes.length !== codeIds.length) return res.status(400).send('❌ بعض الأكواد غير موجودة');
+    if (selectedCodes.some(code => code.is_used)) {
+      return res.status(400).send('❌ لا يمكن حذف مجموعة تحتوي على أكواد مستخدمة');
+    }
+
+    await RechargeCode.destroy({ where: { id: codeIds, is_used: false } });
+    res.redirect('/admin/recharge-codes');
+  } catch (error) {
+    console.error('Failed to delete recharge codes:', error);
+    res.status(500).send('❌ حصلت مشكلة أثناء حذف الأكواد: ' + error.message);
   }
 });
 
@@ -8318,7 +8408,11 @@ async function startServer() {
     console.log('RechargeCode table is ready');
     console.log('✅ تم تجهيز اتصال قاعدة البيانات بنجاح (تم تعطيل sequelize.sync مؤقتًا)');
   } catch (error) {
-    console.error('❌ فشل الاتصال بقاعدة البيانات أثناء التشغيل الابتدائي:', error.message);
+    console.error('❌ فشل الاتصال بقاعدة البيانات أثناء التشغيل الابتدائي:', {
+      name: error.name,
+      code: error.original?.code || error.parent?.code || error.code,
+      message: error.message || error.original?.message || error.parent?.message || 'Unknown database error',
+    });
     console.error('السيرفر سيبدأ بدون اتصال قاعدة البيانات. سأحاول إعادة الاتصال في الخلفية.');
   }
 
